@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/JuliusBrussee/caveman/engine"
 	"github.com/JuliusBrussee/caveman/engine/ccr"
+	"github.com/JuliusBrussee/caveman/proxy/internal/gitsafe"
 	"github.com/JuliusBrussee/caveman/proxy/internal/nativepack"
 	"github.com/JuliusBrussee/caveman/proxy/internal/repointel"
 	"github.com/JuliusBrussee/caveman/proxy/internal/sessionusage"
@@ -106,8 +108,8 @@ type Runtime struct {
 	sessionLocks          [64]sync.Mutex
 	repositoryMu          sync.RWMutex
 	repositoryMaps        map[string]*repositoryMapEntry
-	repositorySessionRefs map[string]string
-	repositoryWarming     map[string]bool
+	repositorySessionRefs map[string]repositoryReference
+	repositoryWarming     map[string]string
 	repositoryEnded       map[string]bool
 	activeSessions        map[string]sessionActivity
 	lastActivity          time.Time
@@ -126,14 +128,20 @@ type sessionActivity struct {
 
 type repositoryMapEntry struct {
 	done    chan struct{}
+	root    string
 	repoMap repointel.Map
 	err     error
+}
+
+type repositoryReference struct {
+	key string
+	id  string
 }
 
 func newRuntime(store *ccr.Store) *Runtime {
 	return &Runtime{
 		store: store, repositoryMaps: map[string]*repositoryMapEntry{},
-		repositorySessionRefs: map[string]string{}, repositoryWarming: map[string]bool{}, repositoryEnded: map[string]bool{},
+		repositorySessionRefs: map[string]repositoryReference{}, repositoryWarming: map[string]string{}, repositoryEnded: map[string]bool{},
 		activeSessions: map[string]sessionActivity{}, lastActivity: time.Now(),
 		// A store-less engine: Detect reads only the bytes handed to it.
 		detect: engine.New(nil, nil).Detect,
@@ -529,12 +537,10 @@ func (r *Runtime) startRepositoryEvidence(request Request) {
 	}
 	key := repositoryKey(request.Session)
 	r.repositoryMu.Lock()
-	// Check the bail-out BEFORE creating the entry. Inserting first meant a second
-	// CWD in an already-warming session left a repositoryMaps entry whose `done`
-	// was never closed (the warming goroutine below only starts when !exists), so
-	// the next request for that key blocked its waiter forever and
-	// repositoryWarming stayed true for the rest of the session.
-	if r.repositorySessionRefs[request.Session.ID] != "" || r.repositoryWarming[request.Session.ID] {
+	// A session can change repositories; map handles and in-flight warmers must
+	// belong to its selected CWD/state, not whichever repository warmed first.
+	ref := r.repositorySessionRefs[request.Session.ID]
+	if r.repositoryEnded[request.Session.ID] || (ref.key == key && ref.id != "") || r.repositoryWarming[request.Session.ID] == key {
 		r.repositoryMu.Unlock()
 		return
 	}
@@ -543,15 +549,24 @@ func (r *Runtime) startRepositoryEvidence(request Request) {
 		entry = &repositoryMapEntry{done: make(chan struct{})}
 		r.repositoryMaps[key] = entry
 	}
-	r.repositoryWarming[request.Session.ID] = true
+	delete(r.repositorySessionRefs, request.Session.ID)
+	r.repositoryWarming[request.Session.ID] = key
 	r.repositoryMu.Unlock()
 
 	if !exists {
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			defer cancel()
-			repoMap, _, err := repointel.Build(ctx, request.Session.CWD, request.Session.RepositoryState, nil)
+			// CWD selects a Git working tree, never a collection of neighboring
+			// checkouts. Resolve it before Build, whose intentional non-Git
+			// filesystem fallback would otherwise scan the entire collection.
+			root, err := selectedRepositoryRoot(ctx, request.Session.CWD)
+			var repoMap repointel.Map
+			if err == nil {
+				repoMap, _, err = repointel.Build(ctx, root, request.Session.RepositoryState, nil)
+			}
 			r.repositoryMu.Lock()
+			entry.root = root
 			entry.repoMap = repoMap
 			entry.err = err
 			close(entry.done)
@@ -564,40 +579,70 @@ func (r *Runtime) startRepositoryEvidence(request Request) {
 		r.repositoryMu.RLock()
 		repoMap, mapErr := entry.repoMap, entry.err
 		r.repositoryMu.RUnlock()
-		if mapErr != nil {
-			r.repositoryMu.Lock()
-			delete(r.repositoryWarming, request.Session.ID)
-			r.repositoryMu.Unlock()
-			return
-		}
-		data, err := json.Marshal(repoMap)
-		if err == nil {
-			var id string
-			r.repositoryMu.Lock()
-			if r.repositoryEnded[request.Session.ID] {
-				delete(r.repositoryWarming, request.Session.ID)
-				r.repositoryMu.Unlock()
-				return
-			}
-			id, err = r.store.PutObject(ccr.Object{
-				Type: ccr.ObjectRepositoryMap, Source: "native:repository-map", SessionID: request.Session.ID,
-				RepositoryState: request.Session.RepositoryState, TransformVersion: "repository-map-v1",
-				Currentness: ccr.Current, Lifecycle: ccr.Warm, Data: data,
-			})
-			if err == nil {
-				r.repositorySessionRefs[request.Session.ID] = id
-			}
-			r.repositoryMu.Unlock()
+		var data []byte
+		if mapErr == nil {
+			data, mapErr = json.Marshal(repoMap)
 		}
 		r.repositoryMu.Lock()
+		defer r.repositoryMu.Unlock()
+		// A slower previous selection must not publish into, or clear the
+		// warmer for, the session's newer selection or an ended session.
+		if r.repositoryWarming[request.Session.ID] != key || r.repositoryEnded[request.Session.ID] {
+			return
+		}
 		delete(r.repositoryWarming, request.Session.ID)
-		r.repositoryMu.Unlock()
+		if mapErr != nil {
+			return
+		}
+		id, err := r.store.PutObject(ccr.Object{
+			Type: ccr.ObjectRepositoryMap, Source: "native:repository-map", SessionID: request.Session.ID,
+			RepositoryState: request.Session.RepositoryState, TransformVersion: "repository-map-v1",
+			Currentness: ccr.Current, Lifecycle: ccr.Warm, Data: data,
+		})
+		if err == nil {
+			r.repositorySessionRefs[request.Session.ID] = repositoryReference{key: key, id: id}
+		}
 	}()
+}
+
+func selectedRepositoryRoot(ctx context.Context, cwd string) (string, error) {
+	cwd, err := filepath.Abs(cwd)
+	if err != nil {
+		return "", err
+	}
+	cwd, err = filepath.EvalSymlinks(cwd)
+	if err != nil {
+		return "", err
+	}
+	for root := cwd; ; root = filepath.Dir(root) {
+		if _, err := os.Lstat(filepath.Join(root, ".git")); err == nil {
+			output, err := gitsafe.Command(ctx, cwd, "rev-parse", "--show-toplevel").Output()
+			if err != nil {
+				return "", err
+			}
+			reported, err := filepath.EvalSymlinks(strings.TrimSpace(string(output)))
+			if err != nil {
+				return "", err
+			}
+			// core.worktree is repository-controlled. It cannot broaden or move
+			// the CWD-selected boundary to an ancestor or sibling checkout.
+			if reported != root {
+				return "", errors.New("native runtime: Git root differs from selected repository")
+			}
+			return root, nil
+		} else if !os.IsNotExist(err) {
+			return "", err
+		}
+		if filepath.Dir(root) == root {
+			return "", errors.New("native runtime: cwd does not select a Git working tree")
+		}
+	}
 }
 
 func (r *Runtime) markRepositorySessionEnded(sessionID string) {
 	r.repositoryMu.Lock()
 	r.repositoryEnded[sessionID] = true
+	delete(r.repositorySessionRefs, sessionID)
 	delete(r.repositoryWarming, sessionID)
 	r.repositoryMu.Unlock()
 }
@@ -647,8 +692,12 @@ func (r *Runtime) repositoryEvidenceContext(request Request) (string, string, er
 	key := repositoryKey(request.Session)
 	r.repositoryMu.RLock()
 	entry := r.repositoryMaps[key]
-	mapRef := r.repositorySessionRefs[request.Session.ID]
+	ref := r.repositorySessionRefs[request.Session.ID]
 	r.repositoryMu.RUnlock()
+	mapRef := ""
+	if ref.key == key {
+		mapRef = ref.id
+	}
 	if entry == nil {
 		return "Caveman repository evidence: unavailable; no path claims injected.", "", nil
 	}
@@ -1210,7 +1259,19 @@ func (r *Runtime) captureTestImpact(request Request, changedPath string) {
 		if mapErr != nil {
 			return
 		}
-		impact := repointel.ImpactTests(repoMap, []string{changedPath})
+		path := changedPath
+		if !filepath.IsAbs(path) {
+			cwd, err := filepath.EvalSymlinks(request.Session.CWD)
+			if err != nil {
+				return
+			}
+			path = filepath.Join(cwd, path)
+		}
+		relative, err := filepath.Rel(entry.root, path)
+		if err != nil {
+			return
+		}
+		impact := repointel.ImpactTests(repoMap, []string{relative})
 		if len(impact.AffectedTests) == 0 {
 			return
 		}

@@ -5417,9 +5417,7 @@ async function spawnWrapped(
   // Codex is excluded by design, and the README has said so all along: its runtime
   // rejects the rewrite (openai/codex#18491). No door actually implemented that, and
   // since #1037 shrinkHook declines every Codex tool event — so registering it here
-  // bought nothing but a node spawn per tool call. The persistent `caveman enable
-  // codex` door still writes the entry; removing it there needs a migration, since
-  // nativeHookEntriesHealthy would read every existing install as degraded.
+  // bought nothing but a node spawn per tool call.
   const includeShrink = !opts.noShrink && wrapCompressEnabled(opts) && agent?.id !== "codex";
   let childArgs = cmdArgs;
   let env: NodeJS.ProcessEnv;
@@ -6526,8 +6524,10 @@ function canonicalManagedHookEntry(entry: Record<string, unknown>): string | und
 // the config said and there was no persistent way to run the native
 // integration without it (#1049). Read in ONE place so the writers and the
 // health check that judges them cannot disagree about what is expected.
-function nativeShrinkEnabled(): boolean {
-  return resolveCapabilities().values["think.shrink"].value as boolean;
+function nativeShrinkEnabled(agentId: "claude" | "codex" | "gemini"): boolean {
+  // Codex rejects command rewriting (#1037). Keep legacy entries recognizable
+  // by removal, while writers and health checks agree they must be retired.
+  return agentId !== "codex" && resolveCapabilities().values["think.shrink"].value as boolean;
 }
 
 function nativeHooksDocument(agentId: "claude" | "codex" | "gemini", includeShrink: boolean, base: Record<string, unknown> = {}, includeRecall = false): Record<string, unknown> {
@@ -6614,7 +6614,7 @@ function nativeHookEntriesHealthy(root: Record<string, unknown>, agentId: "claud
     ? root.hooks as Record<string, unknown>
     : undefined;
   if (!hooks) return false;
-  const expected = nativeHooksDocument(agentId, nativeShrinkEnabled()).hooks as Record<string, unknown>;
+  const expected = nativeHooksDocument(agentId, nativeShrinkEnabled(agentId)).hooks as Record<string, unknown>;
   const required = Object.entries(expected).every(([event, expectedRaw]) => {
     const actual = Array.isArray(hooks[event]) ? hooks[event] as Array<Record<string, unknown>> : [];
     const actualEntries = new Set(actual.map(canonicalManagedHookEntry).filter(Boolean));
@@ -7049,7 +7049,7 @@ function claudeNativeMutations(gw: string, mcpBinary: string): NativeMutation[] 
   // Claude Code names for the override. Never clobber an explicit user value.
   if (env.ENABLE_TOOL_SEARCH === undefined) env.ENABLE_TOOL_SEARCH = TOOL_SEARCH_DEFAULT;
   settings.env = env;
-  const withHooks = nativeHooksDocument("claude", nativeShrinkEnabled(), settings);
+  const withHooks = nativeHooksDocument("claude", nativeShrinkEnabled("claude"), settings);
 
   const mcpPath = claudeGlobalConfigPath();
   const mcpBefore = fileBytes(mcpPath);
@@ -7119,7 +7119,7 @@ function geminiNativeMutations(gw: string, mcpBinary: string): NativeMutation[] 
   const installedMcp = { command: mcpBinary, args: [] };
   servers.caveman = installedMcp;
   settings.mcpServers = servers;
-  const withHooks = nativeHooksDocument("gemini", nativeShrinkEnabled(), settings);
+  const withHooks = nativeHooksDocument("gemini", nativeShrinkEnabled("gemini"), settings);
 
   const envPath = join(geminiConfigDir(), ".env");
   const envBefore = fileBytes(envPath);
@@ -7509,7 +7509,7 @@ function codexNativeMutations(gw: string, mcpBinary: string): NativeMutation[] {
   const hooksBefore = fileBytes(hooksPath);
   const hooksRoot = parseJsonFileObject(hooksPath, hooksBefore);
   assertNativeHooksShape(hooksPath, hooksRoot, "codex");
-  const hooks = nativeHooksDocument("codex", nativeShrinkEnabled(), hooksRoot);
+  const hooks = nativeHooksDocument("codex", nativeShrinkEnabled("codex"), hooksRoot);
   const configPath = join(codexHomeDir(), "config.toml");
   const configBefore = fileBytes(configPath);
   const subscription = detectCodexWrapAuthMode() === "subscription";
@@ -8655,12 +8655,7 @@ function nativeIntegrationStatus(agent: NativeAgent) {
     lifecycle_hooks: agent !== "aider" && ownedHealthy,
     core: coreActive,
     mcp_recovery: agent !== "aider" && ownedHealthy && Boolean(mcp?.probe.current),
-    // Codex is false for the same reason hermes is: no command rewrite happens. The
-    // shrink-hook entry is still written into ~/.codex/hooks.json (removing it from
-    // nativeHooksDocument would make every existing install read as degraded, since
-    // nativeHookEntriesHealthy rejects a managed entry the expected document lacks),
-    // but since #1037 shrinkHook declines every Codex tool event, so the presence of
-    // that entry no longer evidences a rewrite. Report the behavior, not the file.
+    // Codex and Hermes do not rewrite commands, regardless of legacy hook entries.
     tool_rewrite: agent !== "aider" && ownedHealthy && (agent === "hermes" || agent === "codex" ? false : agent === "pi" ? fileText.includes("caveman:native-pi") : fileText.includes("shrink-hook")),
     shared_runtime: proxyHealthy,
   };

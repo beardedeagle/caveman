@@ -356,6 +356,7 @@ func TestModelVisibleTaskPolicyHasNoCountBasedCodePressure(t *testing.T) {
 
 func TestFullProfileWarmsRepositoryMapAndInjectsTypedTaskEvidence(t *testing.T) {
 	root := t.TempDir()
+	repositoryGit(t, root, "init", "-q")
 	if err := os.WriteFile(filepath.Join(root, "go.mod"), []byte("module example.test/repo\n\ngo 1.26\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -498,6 +499,7 @@ func TestRenderRepositoryEvidenceShowsOnlyDirectMatches(t *testing.T) {
 
 func TestRepositoryEvidenceInjectsNothingWithoutDirectMatch(t *testing.T) {
 	root := t.TempDir()
+	repositoryGit(t, root, "init", "-q")
 	if err := os.WriteFile(filepath.Join(root, "handler.go"), []byte("package main\n\nfunc Serve() {}\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -554,6 +556,7 @@ func TestRepositoryEvidenceInjectsNothingWithoutDirectMatch(t *testing.T) {
 
 func TestRepositoryEvidenceIgnoresPixiVendorTree(t *testing.T) {
 	root := t.TempDir()
+	repositoryGit(t, root, "init", "-q")
 	write := func(path, body string) {
 		t.Helper()
 		full := filepath.Join(root, filepath.FromSlash(path))
@@ -600,6 +603,7 @@ func TestRepositoryEvidenceIgnoresPixiVendorTree(t *testing.T) {
 
 func TestRepositoryIntelligenceAblationIsMechanismReal(t *testing.T) {
 	root := t.TempDir()
+	repositoryGit(t, root, "init", "-q")
 	if err := os.WriteFile(filepath.Join(root, "main.go"), []byte("package main\nfunc main() {}\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -1387,6 +1391,7 @@ func containsType(objects []ccr.Object, objectType ccr.ObjectType) bool {
 // and the handle reads as authoritative.
 func TestStoredEvidenceBundleCarriesOnlyDirectItems(t *testing.T) {
 	root := t.TempDir()
+	repositoryGit(t, root, "init", "-q")
 	// `handler.go` matches the term in its own name; `handler/serve.go` matches
 	// only because an ancestor directory does, which is the ranking that pointed
 	// at unrelated files. Fillers keep BM25 IDF positive.

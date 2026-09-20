@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -420,21 +421,60 @@ test("disable refuses a removed pre-existing file and keeps journal", async () =
   assert.ok(existsSync(join(fx.home, ".caveman", "integrations", "claude.json")));
 });
 
-// `caveman enable codex` still writes a shrink-hook entry into ~/.codex/hooks.json,
-// but since #1037 that hook declines every Codex tool event. Reporting the component
-// off a substring of the hooks file therefore claimed a rewrite that no longer
-// happens. Codex is an installed, healthy integration WITHOUT command-output rewrite.
+// Since #1037 shrink-hook declines every Codex tool event. A healthy Codex
+// integration must not register it or claim command-output rewriting.
 test("doctor does not claim a Codex tool rewrite that shrink-hook declines", async () => {
   const fx = fixture();
   mkdirSync(join(fx.home, ".codex"), { recursive: true });
   writeFileSync(join(fx.home, ".codex", "config.toml"), 'approval_policy = "never"\n');
   assert.equal((await run(["enable", "codex"], fx.env)).code, 0);
+  assert.doesNotMatch(readFileSync(join(fx.home, ".codex", "hooks.json"), "utf8"), /shrink-hook/);
   const out = await run(["doctor", "codex"], fx.env);
   const result = JSON.parse(out.stdout);
+  assert.equal(result.state, "installed");
   assert.equal(result.components.tool_rewrite, false, "Codex commands are no longer rewritten");
   // The rest of the integration is untouched: this is a claim fix, not a downgrade.
   assert.equal(result.components.lifecycle_hooks, true);
   assert.equal(result.components.routing, true);
+});
+
+test("repair retires an existing Codex shrink hook without losing other hooks or recovery", async () => {
+  const fx = fixture();
+  assert.equal((await run(["enable", "codex"], fx.env)).code, 0);
+  const hooksPath = join(fx.home, ".codex", "hooks.json");
+  const configPath = join(fx.home, ".codex", "config.toml");
+  const originalConfig = readFileSync(configPath, "utf8");
+  const hooks = JSON.parse(readFileSync(hooksPath, "utf8"));
+  const legacyEntry = { hooks: [{ type: "command", command: "/old/bin/caveman shrink-hook" }] };
+  hooks.hooks.PreToolUse.push(legacyEntry);
+  const legacyBytes = JSON.stringify(hooks, null, 2) + "\n";
+  const journalPath = join(fx.home, ".caveman", "integrations", "codex.json");
+  const journal = JSON.parse(readFileSync(journalPath, "utf8"));
+  journal.operations.find((entry) => entry.kind === "codex-hooks").after_sha256 =
+    `sha256:${createHash("sha256").update(legacyBytes).digest("hex")}`;
+  writeFileSync(journalPath, JSON.stringify(journal, null, 2) + "\n");
+  // A user hook added after the old install forces the owned-entry merge path.
+  const userEntry = { hooks: [{ type: "command", command: "keep-codex" }] };
+  hooks.hooks.PreToolUse.push(userEntry);
+  writeFileSync(hooksPath, JSON.stringify(hooks, null, 2) + "\n");
+
+  assert.equal(JSON.parse((await run(["doctor", "codex"], fx.env)).stdout).state, "degraded");
+  const repaired = await run(["doctor", "codex", "--fix"], fx.env);
+  assert.equal(repaired.code, 0, repaired.stderr);
+  const after = readFileSync(hooksPath, "utf8");
+  assert.doesNotMatch(after, /shrink-hook/);
+  assert.ok(JSON.parse(after).hooks.PreToolUse.some((entry) => JSON.stringify(entry) === JSON.stringify(userEntry)));
+  assert.equal(readFileSync(configPath, "utf8"), originalConfig);
+  const healthy = JSON.parse((await run(["doctor", "codex"], fx.env)).stdout);
+  assert.equal(healthy.state, "installed");
+  assert.equal(healthy.components.lifecycle_hooks, true);
+  assert.equal(healthy.components.mcp_recovery, true);
+  assert.equal(healthy.components.routing, true);
+  for (const argv of [["enable", "codex"], ["doctor", "codex", "--fix"]]) {
+    const repeated = await run(argv, fx.env);
+    assert.equal(repeated.code, 0, repeated.stderr);
+    assert.equal(readFileSync(hooksPath, "utf8"), after);
+  }
 });
 
 // Everyone who ran `caveman enable codex` on an api key before #1045 has the

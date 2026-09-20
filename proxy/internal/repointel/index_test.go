@@ -255,6 +255,24 @@ func TestEmptyGitListingFallsBackToWalk(t *testing.T) {
 	}
 }
 
+func TestWalkDoesNotCrossNestedRepositoryBoundaries(t *testing.T) {
+	root := t.TempDir()
+	writeTree(t, root, map[string]string{
+		"src/proxy.go":                   "package src\nfunc Proxy() {}\n",
+		"checkout/.git/HEAD":             "ref: refs/heads/main\n",
+		"checkout/src/foreign.go":        "package foreign\n",
+		"linked-worktree/.git":           "gitdir: /another/repo/.git/worktrees/linked\n",
+		"linked-worktree/src/foreign.go": "package foreign\n",
+	})
+	files, truncated, err := walkFiles(context.Background(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if truncated || len(files) != 1 || files[0] != "src/proxy.go" {
+		t.Fatalf("walk crossed selected repository boundary: %v (truncated=%t)", files, truncated)
+	}
+}
+
 // Running git inside a repository executes what that repository's config says
 // to execute. core.fsmonitor runs during an index read, so `ls-files` alone
 // would be enough for a freshly cloned untrusted repository to run code.

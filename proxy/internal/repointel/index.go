@@ -35,7 +35,7 @@ const (
 	StrengthMetadata = "metadata_only"
 	StrengthNone     = "none"
 	// ListingGit and ListingWalk disclose how the file set was obtained. The
-	// two can disagree (git omits submodule contents; the walk sees them), so
+	// two can disagree (the walk cannot apply all Git ignore rules), so
 	// the basis is part of the map and of its content hash.
 	ListingGit   = "git_index_and_untracked_excluding_ignored"
 	ListingWalk  = "filesystem_walk_dependency_marker_filtered"
@@ -440,6 +440,10 @@ var dependencyRootMarkers = []string{"conda-meta", "pyvenv.cfg", "site-packages"
 func excludedDirectory(name, path string) bool {
 	folded := strings.ToLower(name)
 	if dependencyDirectoryNames[folded] {
+		return true
+	}
+	// Nested checkouts and linked worktrees belong to a different repository.
+	if _, err := os.Lstat(filepath.Join(path, ".git")); err == nil {
 		return true
 	}
 	if manifests, ambiguous := generatedDirectoryManifests[folded]; ambiguous && hasSibling(path, manifests) {
